@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Testing
+.pytest_cache/
+
+# Ruff
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Benchmark outputs
+results/*.csv
+results/*.png
