@@ -9,6 +9,7 @@ description = "Local CPU benchmark for PyTorch distributed collective communicat
 requires-python = ">=3.10"
 dependencies = [
     "torch",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
