@@ -15,6 +15,5 @@ __pycache__/
 # macOS
 .DS_Store
 
-# Benchmark outputs
-results/*.csv
-results/*.png
+# Temporary benchmark outputs
+results/*.tmp.csv
