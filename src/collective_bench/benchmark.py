@@ -1,9 +1,16 @@
 from dataclasses import dataclass
+from enum import Enum
 from statistics import mean, median
 from time import perf_counter
 
 import torch
 import torch.distributed as dist
+
+
+class CollectiveOperation(str, Enum):
+    ALL_REDUCE = "all_reduce"
+    ALL_GATHER = "all_gather"
+    BROADCAST = "broadcast"
 
 
 @dataclass(frozen=True)
@@ -39,7 +46,9 @@ def numel_for_bytes(
     return size_bytes // element_size
 
 
-def summarize_latencies(latencies_seconds: list[float]) -> LatencySummary:
+def summarize_latencies(
+    latencies_seconds: list[float],
+) -> LatencySummary:
     if not latencies_seconds:
         raise ValueError("At least one latency measurement is required.")
 
@@ -56,12 +65,132 @@ def summarize_latencies(latencies_seconds: list[float]) -> LatencySummary:
     )
 
 
-def benchmark_all_reduce(
+def prepare_all_gather_outputs(
+    operation: CollectiveOperation,
+    tensor: torch.Tensor,
+    world_size: int,
+) -> list[torch.Tensor] | None:
+    if operation != CollectiveOperation.ALL_GATHER:
+        return None
+
+    return [
+        torch.empty_like(tensor)
+        for _ in range(world_size)
+    ]
+
+
+def execute_collective(
+    operation: CollectiveOperation,
+    tensor: torch.Tensor,
+    world_size: int,
+    all_gather_outputs: list[torch.Tensor] | None,
+) -> None:
+    if operation == CollectiveOperation.ALL_REDUCE:
+        dist.all_reduce(
+            tensor,
+            op=dist.ReduceOp.SUM,
+        )
+        return
+
+    if operation == CollectiveOperation.ALL_GATHER:
+        if all_gather_outputs is None:
+            raise RuntimeError(
+                "all_gather requires output tensors."
+            )
+
+        if len(all_gather_outputs) != world_size:
+            raise RuntimeError(
+                "all_gather output list must match world size."
+            )
+
+        dist.all_gather(
+            all_gather_outputs,
+            tensor,
+        )
+        return
+
+    if operation == CollectiveOperation.BROADCAST:
+        dist.broadcast(
+            tensor,
+            src=0,
+        )
+        return
+
+    raise ValueError(
+        f"Unsupported collective operation: {operation}"
+    )
+
+
+def validate_collective_result(
+    operation: CollectiveOperation,
+    tensor: torch.Tensor,
+    world_size: int,
+    all_gather_outputs: list[torch.Tensor] | None,
+) -> None:
+    if operation == CollectiveOperation.ALL_REDUCE:
+        expected = float(
+            sum(range(1, world_size + 1))
+        )
+
+        if not torch.all(tensor == expected):
+            raise RuntimeError(
+                "all_reduce produced an unexpected result."
+            )
+
+        return
+
+    if operation == CollectiveOperation.ALL_GATHER:
+        if all_gather_outputs is None:
+            raise RuntimeError(
+                "all_gather results are missing."
+            )
+
+        for source_rank, output in enumerate(
+            all_gather_outputs
+        ):
+            expected = float(source_rank + 1)
+
+            if not torch.all(output == expected):
+                raise RuntimeError(
+                    "all_gather produced an unexpected result."
+                )
+
+        return
+
+    if operation == CollectiveOperation.BROADCAST:
+        expected = 1.0
+
+        if not torch.all(tensor == expected):
+            raise RuntimeError(
+                "broadcast produced an unexpected result."
+            )
+
+        return
+
+    raise ValueError(
+        f"Unsupported collective operation: {operation}"
+    )
+
+
+def benchmark_collective(
     rank: int,
     world_size: int,
+    operation: CollectiveOperation,
     config: BenchmarkConfig,
 ) -> LatencySummary | None:
-    numel = numel_for_bytes(config.message_size_bytes)
+    if config.warmup_iterations < 0:
+        raise ValueError(
+            "warmup_iterations cannot be negative."
+        )
+
+    if config.measured_iterations <= 0:
+        raise ValueError(
+            "measured_iterations must be greater than zero."
+        )
+
+    numel = numel_for_bytes(
+        config.message_size_bytes
+    )
 
     tensor = torch.full(
         (numel,),
@@ -69,14 +198,22 @@ def benchmark_all_reduce(
         dtype=torch.float32,
     )
 
+    all_gather_outputs = prepare_all_gather_outputs(
+        operation=operation,
+        tensor=tensor,
+        world_size=world_size,
+    )
+
     for _ in range(config.warmup_iterations):
         tensor.fill_(float(rank + 1))
 
         dist.barrier()
 
-        dist.all_reduce(
-            tensor,
-            op=dist.ReduceOp.SUM,
+        execute_collective(
+            operation=operation,
+            tensor=tensor,
+            world_size=world_size,
+            all_gather_outputs=all_gather_outputs,
         )
 
     local_latencies: list[float] = []
@@ -88,14 +225,23 @@ def benchmark_all_reduce(
 
         start = perf_counter()
 
-        dist.all_reduce(
-            tensor,
-            op=dist.ReduceOp.SUM,
+        execute_collective(
+            operation=operation,
+            tensor=tensor,
+            world_size=world_size,
+            all_gather_outputs=all_gather_outputs,
         )
 
         elapsed = perf_counter() - start
 
         local_latencies.append(elapsed)
+
+    validate_collective_result(
+        operation=operation,
+        tensor=tensor,
+        world_size=world_size,
+        all_gather_outputs=all_gather_outputs,
+    )
 
     local_tensor = torch.tensor(
         local_latencies,
@@ -103,27 +249,35 @@ def benchmark_all_reduce(
     )
 
     if rank == 0:
-        gathered = [
+        gathered_latencies = [
             torch.empty_like(local_tensor)
             for _ in range(world_size)
         ]
     else:
-        gathered = None
+        gathered_latencies = None
 
     dist.gather(
         local_tensor,
-        gather_list=gathered,
+        gather_list=gathered_latencies,
         dst=0,
     )
 
     if rank != 0:
         return None
 
-    if gathered is None:
-        raise RuntimeError("Rank 0 did not receive latency measurements.")
+    if gathered_latencies is None:
+        raise RuntimeError(
+            "Rank 0 did not receive latency measurements."
+        )
 
-    measurements = torch.stack(gathered)
+    measurements = torch.stack(
+        gathered_latencies
+    )
 
-    slowest_rank_per_iteration = measurements.max(dim=0).values.tolist()
+    slowest_rank_per_iteration = (
+        measurements.max(dim=0).values.tolist()
+    )
 
-    return summarize_latencies(slowest_rank_per_iteration)
+    return summarize_latencies(
+        slowest_rank_per_iteration
+    )
